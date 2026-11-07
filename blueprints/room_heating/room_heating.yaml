@@ -106,24 +106,56 @@ variables:
   away_temperature: !input away_temperature
   night_temperature: !input night_temperature
   debug_enabled: !input debug_enabled
-  apply_heating: "{{ trigger is not defined or trigger.id != 'calibration' }}"
+  entity_change_kind: >
+    {% if trigger is defined and trigger.id == 'entity_change' %}
+      {% set event = trigger.event.data %}
+      {% set new = event.new_state %}
+      {% set old = event.old_state %}
+      {% if new is none %}
+        {{ 'ignored' }}
+      {% elif (event.entity_id in [home_occupied_helper, night_mode_helper]
+               or (event.entity_id.startswith('binary_sensor.')
+                   and event.entity_id in area_entities(room)
+                   and new.attributes.get('device_class') == 'window'))
+              and (old is none or old.state != new.state) %}
+        {{ 'heating' }}
+      {% elif event.entity_id in area_entities(room) %}
+        {% set device = device_id(event.entity_id) %}
+        {% if event.entity_id.startswith('sensor.')
+              and event.entity_id not in excluded_sensors
+              and new.attributes.get('device_class') == 'temperature'
+              and new.attributes.get('unit_of_measurement') == '°C'
+              and (device is none
+                   or device_entities(device) | select('match', '^climate[.]') | list | count == 0)
+              and (old is none or old.state != new.state) %}
+          {{ 'calibration' }}
+        {% elif event.entity_id.startswith('climate.')
+                and (old is none
+                     or old.attributes.get('current_temperature')
+                        != new.attributes.get('current_temperature')) %}
+          {{ 'calibration' }}
+        {% else %}
+          {{ 'ignored' }}
+        {% endif %}
+      {% else %}
+        {{ 'ignored' }}
+      {% endif %}
+    {% else %}
+      {{ 'ignored' }}
+    {% endif %}
+  apply_heating: >
+    {{ trigger is not defined or trigger.id == 'startup'
+       or entity_change_kind == 'heating' }}
 
 condition:
   - condition: template
     value_template: >
-      {% if trigger.id == 'calibration' %}
+      {% if trigger.id == 'entity_change' and entity_change_kind == 'ignored' %}
+        {{ false }}
+      {% elif not apply_heating %}
         {{ this.attributes.current == 0 }}
-      {% elif trigger.id != 'entity_change' %}
-        {{ true }}
       {% else %}
-        {% set event = trigger.event.data %}
-        {{ event.new_state is not none
-           and (event.old_state is none or event.old_state.state != event.new_state.state)
-           and (event.entity_id == home_occupied_helper
-                or event.entity_id == night_mode_helper
-                or (event.entity_id.startswith('binary_sensor.')
-                    and event.entity_id in area_entities(room)
-                    and event.new_state.attributes.get('device_class') == 'window')) }}
+        {{ true }}
       {% endif %}
 
 action:
@@ -225,10 +257,12 @@ action:
           message: |-
             Updated: {{ now().isoformat() }}
             Trigger: {{ (trigger.id | default('manual')) if trigger is defined else 'manual' }}
+            Entity change kind: {{ entity_change_kind }}
             Helper-selected mode: **{{ selected_mode }}**, temperature: **{{ target_temperature }} °C**
             Decision: **{% if windows_open %}{{ 'paused for open window' if apply_heating else 'calibration skipped for open window' }}{% elif expand(window_sensors) | rejectattr('state', 'eq', 'off') | list | count > 0 %}waiting for known window states{% elif not apply_heating %}calibration only; preserve setpoints and HVAC modes{% else %}apply helper-selected temperature{% endif %}**
             Window debounce waited: {{ window_debounce_seconds | round(2) }} s
             Room average: **{{ (room_temperature | round(2) | string + ' °C') if room_temperature is not none else 'no usable readings' }}**
+            Calibration: correction must exceed 0.5 °C; 10-minute cooldown per offset entity since its last value change.
 
             **Windows ({{ window_sensors | count }})**
             {% for entity in window_sensors %}
@@ -353,7 +387,10 @@ action:
                           Room heating: {{ thermostat }} does not support heat mode;
                           skipping it.
   - condition: template
-    value_template: "{{ trigger is defined and trigger.id in ['startup', 'calibration'] }}"
+    value_template: >
+      {{ trigger is defined
+         and (trigger.id in ['startup', 'calibration']
+              or entity_change_kind == 'calibration') }}
   - if:
       - condition: template
         value_template: "{{ room_temperature is none }}"
@@ -400,6 +437,9 @@ action:
                                and state_attr(offset_entity, 'unit_of_measurement') in [none, '', '°C'] }}
                       then:
                         - variables:
+                            cooldown_remaining: >
+                              {% set offset_state = expand(offset_entity) | first %}
+                              {{ [600 - (as_timestamp(now()) - as_timestamp(offset_state.last_changed)), 0] | max }}
                             new_offset: >
                               {% set value = old_offset | float + room_temperature - current_temperature | float %}
                               {% set step = offset_step | float %}
@@ -411,8 +451,8 @@ action:
                         - if:
                             - condition: template
                               value_template: >
-                                {{ (new_offset - old_offset | float) | abs
-                                   >= offset_step | float * 0.5 }}
+                                {{ (new_offset - old_offset | float) | abs | round(6) > 0.5
+                                   and cooldown_remaining == 0 }}
                           then:
                             - action: number.set_value
                               target:

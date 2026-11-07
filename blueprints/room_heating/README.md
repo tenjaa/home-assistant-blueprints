@@ -24,12 +24,13 @@ The automation supports three different temperature settings: comfort, away, and
 
 ### Offset calibration
 
-The automation calibrates the TRV readings against the average of usable external sensors in the room every 10 minutes, on startup, and after automation reloads.
+The automation evaluates calibration when a usable external sensor reading or a thermostat's current temperature changes, on startup, and after automation reloads.
+An updated offset is written at most every 10 minutes and only if the value differs by more than 0.5 °C.
 Sensors belonging to thermostat devices are ignored by default.
 You can exclude additional sensors from calibration by adding them to the `excluded_sensors` list in the automation.
 
 The offset formula assumes an additive Celsius offset already included in the TRV reading.
-Open windows pause calibration. A scheduled calibration tick is skipped if the automation is already running, so it cannot interrupt a heating update.
+Open windows pause calibration.
 
 ### Window detection
 
@@ -39,7 +40,7 @@ The automation turns off heating after a window has been open for 5 seconds and 
 
 Heating settings are applied on helper/window changes, Home Assistant startup, and automation reloads.
 Manual temperature and HVAC mode changes are preserved until one of these events.
-The 10-minute timer changes calibration offsets only; it does not reset setpoints or HVAC modes.
+Temperature-change triggers and the 10-minute fallback change calibration offsets only; they do not reset setpoints or HVAC modes.
 
 ## Setup
 
