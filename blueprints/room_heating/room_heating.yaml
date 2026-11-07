@@ -1,0 +1,438 @@
+blueprint:
+  name: Room heating with helpers
+  description: |
+    Choose a room, a home occupied helper, and a night mode helper.
+    Thermostats, windows, and temperature sensors are detected automatically.
+
+    See the [blueprint README](https://github.com/tenjaa/home-assistant-blueprints/blob/main/blueprints/room_heating/README.md) for more information.
+  domain: automation
+  source_url: https://github.com/tenjaa/home-assistant-blueprints/blob/main/blueprints/room_heating/room_heating.yaml
+  homeassistant:
+    min_version: "2026.11.0"
+  input:
+    room:
+      name: Room
+      selector:
+        area: {}
+    comfort_temperature:
+      name: Comfort temperature
+      default: 21
+      selector:
+        number:
+          min: 5
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+    away_temperature:
+      name: Away temperature
+      default: 16
+      selector:
+        number:
+          min: 5
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+    night_temperature:
+      name: Night temperature
+      default: 18
+      selector:
+        number:
+          min: 5
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+    home_occupied_helper:
+      name: Home occupied helper
+      description: >
+        On means at least one person is home; off selects away, regardless of
+        night mode.
+      selector:
+        entity:
+          filter:
+            - domain: input_boolean
+    night_mode_helper:
+      name: Night mode helper
+      description: >
+        On selects night while the home occupied helper is on.
+        Off selects comfort.
+      selector:
+        entity:
+          filter:
+            - domain: input_boolean
+    excluded_sensors:
+      name: Excluded room temperature sensors
+      description: >
+        Never use these sensors for calibration. Sensors belonging to thermostat
+        devices are already excluded automatically.
+      default: []
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: temperature
+          multiple: true
+    debug_enabled:
+      name: Debug information
+      description: >
+        Show a persistent notification with detected entities, sensor exclusion
+        reasons, and the heating decision. Updated on each automation run;
+        enabling this does not require configuring any extra helpers.
+      default: false
+      selector:
+        boolean: {}
+
+mode: restart
+
+trigger:
+  - platform: homeassistant
+    event: start
+    id: startup
+  - platform: event
+    event_type: automation_reloaded
+    id: startup
+  - platform: time_pattern
+    minutes: "/10"
+    id: calibration
+  - platform: event
+    event_type: state_changed
+    id: entity_change
+
+variables:
+  room: !input room
+  home_occupied_helper: !input home_occupied_helper
+  night_mode_helper: !input night_mode_helper
+  excluded_sensors: !input excluded_sensors
+  comfort_temperature: !input comfort_temperature
+  away_temperature: !input away_temperature
+  night_temperature: !input night_temperature
+  debug_enabled: !input debug_enabled
+  apply_heating: "{{ trigger is not defined or trigger.id != 'calibration' }}"
+
+condition:
+  - condition: template
+    value_template: >
+      {% if trigger.id == 'calibration' %}
+        {{ this.attributes.current == 0 }}
+      {% elif trigger.id != 'entity_change' %}
+        {{ true }}
+      {% else %}
+        {% set event = trigger.event.data %}
+        {{ event.new_state is not none
+           and (event.old_state is none or event.old_state.state != event.new_state.state)
+           and (event.entity_id == home_occupied_helper
+                or event.entity_id == night_mode_helper
+                or (event.entity_id.startswith('binary_sensor.')
+                    and event.entity_id in area_entities(room)
+                    and event.new_state.attributes.get('device_class') == 'window')) }}
+      {% endif %}
+
+action:
+  - variables:
+      window_sensors: >
+        {{ expand(area_entities(room))
+           | selectattr('entity_id', 'match', '^binary_sensor[.]')
+           | selectattr('attributes.device_class', 'defined')
+           | selectattr('attributes.device_class', 'eq', 'window')
+           | map(attribute='entity_id') | list }}
+      window_debounce_seconds: >
+        {% set windows = expand(window_sensors) | list %}
+        {% set opened = windows | selectattr('state', 'eq', 'on') | list %}
+        {% set changed = (opened if opened else windows | selectattr('state', 'eq', 'off') | list)
+                         | map(attribute='last_changed') | list %}
+        {% if changed %}
+          {% set since = changed | min if opened else changed | max %}
+          {{ [5 - (as_timestamp(now()) - as_timestamp(since)), 0] | max }}
+        {% else %}
+          {{ 0 }}
+        {% endif %}
+  - if:
+      - condition: template
+        value_template: "{{ window_debounce_seconds > 0 }}"
+    then:
+      - delay:
+          seconds: "{{ window_debounce_seconds }}"
+  - variables:
+      thermostats: >
+        {{ area_entities(room) | select('match', '^climate[.]') | list }}
+      windows_open: >
+        {{ expand(window_sensors) | selectattr('state', 'eq', 'on') | list | count > 0 }}
+      selected_mode: >
+        {% if is_state(home_occupied_helper, 'off') %}
+          {{ 'away' }}
+        {% elif is_state(night_mode_helper, 'on') %}
+          {{ 'night' }}
+        {% else %}
+          {{ 'comfort' }}
+        {% endif %}
+      target_temperature: >
+        {{ {'comfort': comfort_temperature, 'away': away_temperature,
+            'night': night_temperature}[selected_mode] }}
+      thermostat_devices: >
+        {% set ns = namespace(devices=[]) %}
+        {% for device in area_entities(room) | map('device_id') | reject('eq', none) | unique %}
+          {% if device_entities(device) | select('match', '^climate[.]') | list | count > 0 %}
+            {% set ns.devices = ns.devices + [device] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.devices }}
+      thermostat_offsets: >
+        {% set ns = namespace(items=[]) %}
+        {% for thermostat in thermostats %}
+          {% set device = device_id(thermostat) %}
+          {% set offsets = device_entities(device) | select('match', '^number[.]')
+                           | select('search', '_(local_temperature_calibration|local_temperature_offset|temperature_calibration|temperature_offset)(?:_[0-9]+)?$')
+                           | list if device is not none else [] %}
+          {% set ns.items = ns.items + [(thermostat, offsets)] %}
+        {% endfor %}
+        {{ dict(ns.items) }}
+      temperature_readings: >
+        {% set ns = namespace(readings=[]) %}
+        {% for sensor in expand(area_entities(room)) %}
+          {% if sensor.entity_id.startswith('sensor.')
+                and sensor.attributes.get('device_class') == 'temperature' %}
+            {% set unit = sensor.attributes.get('unit_of_measurement') %}
+            {% set temperature = none %}
+            {% if sensor.entity_id in excluded_sensors %}
+              {% set reason = 'excluded by configuration' %}
+            {% elif device_id(sensor.entity_id) in thermostat_devices %}
+              {% set reason = 'thermostat device' %}
+            {% elif not is_number(sensor.state) %}
+              {% set reason = 'unavailable or non-numeric' %}
+            {% elif unit != '°C' %}
+              {% set reason = 'unsupported or missing unit' %}
+            {% else %}
+              {% set reason = 'included' %}
+              {% set temperature = sensor.state | float %}
+            {% endif %}
+            {% set ns.readings = ns.readings + [{
+              'entity_id': sensor.entity_id, 'state': sensor.state,
+              'unit': unit, 'reason': reason, 'temperature': temperature}] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.readings }}
+      room_temperature: >
+        {% set values = temperature_readings | selectattr('reason', 'eq', 'included')
+                        | map(attribute='temperature') | list %}
+        {{ values | average if values else none }}
+  - if:
+      - condition: template
+        value_template: "{{ debug_enabled }}"
+    then:
+      - action: persistent_notification.create
+        data:
+          notification_id: "room_heating_debug_{{ this.entity_id }}"
+          title: "Room heating debug - {{ area_name(room) or room }}"
+          message: |-
+            Updated: {{ now().isoformat() }}
+            Trigger: {{ (trigger.id | default('manual')) if trigger is defined else 'manual' }}
+            Helper-selected mode: **{{ selected_mode }}**, temperature: **{{ target_temperature }} °C**
+            Decision: **{% if windows_open %}{{ 'paused for open window' if apply_heating else 'calibration skipped for open window' }}{% elif expand(window_sensors) | rejectattr('state', 'eq', 'off') | list | count > 0 %}waiting for known window states{% elif not apply_heating %}calibration only; preserve setpoints and HVAC modes{% else %}apply helper-selected temperature{% endif %}**
+            Window debounce waited: {{ window_debounce_seconds | round(2) }} s
+            Room average: **{{ (room_temperature | round(2) | string + ' °C') if room_temperature is not none else 'no usable readings' }}**
+
+            **Windows ({{ window_sensors | count }})**
+            {% for entity in window_sensors %}
+            - `{{ entity }}` ({{ state_attr(entity, 'friendly_name') or entity }}): {{ states(entity) }}
+            {% else %}
+            - None detected. Only binary sensors with device class `window` in this room are included.
+            {% endfor %}
+
+            **Thermostats / TRVs ({{ thermostats | count }})**
+            {% for entity in thermostats %}
+            - `{{ entity }}` ({{ state_attr(entity, 'friendly_name') or entity }}): {{ states(entity) }}; current {{ state_attr(entity, 'current_temperature') }} °C; setpoint {{ state_attr(entity, 'temperature') }} °C; HVAC modes {{ state_attr(entity, 'hvac_modes') }}.
+              Calibration: {{ thermostat_offsets[entity] | join(', ') or 'no supported offset number detected' }}.
+            {% else %}
+            - None detected. Assign climate entities/devices to this room.
+            {% endfor %}
+
+            **Temperature sensors ({{ temperature_readings | count }})**
+            {% for sensor in temperature_readings %}
+            - `{{ sensor.entity_id }}` ({{ state_attr(sensor.entity_id, 'friendly_name') or sensor.entity_id }}): {{ sensor.state }} {{ sensor.unit or '(no unit)' }} - **{{ sensor.reason }}**{% if sensor.temperature is not none %} ({{ sensor.temperature | round(2) }} °C){% endif %}.
+            {% else %}
+            - None detected. Assign temperature sensors/devices to this room.
+            {% endfor %}
+
+            **Helpers**
+            Home occupied: `{{ home_occupied_helper }}`={{ states(home_occupied_helper) }}
+            Night mode: `{{ night_mode_helper }}`={{ states(night_mode_helper) }}
+
+            Snapshot before thermostat writes. Inspect this automation's trace for service errors and calibration changes.
+  - if:
+      - condition: template
+        value_template: "{{ thermostats | count == 0 }}"
+    then:
+      - action: system_log.write
+        data:
+          level: warning
+          logger: blueprints.room_heating
+          message: "Room heating: no climate entities found in area {{ room }}."
+  - if:
+      - condition: template
+        value_template: "{{ windows_open }}"
+    then:
+      - repeat:
+          for_each: "{{ thermostats if apply_heating else [] }}"
+          sequence:
+            - variables:
+                thermostat: "{{ repeat.item }}"
+            - if:
+                - condition: template
+                  value_template: "{{ states(thermostat) not in ['unknown', 'unavailable', 'off'] }}"
+              then:
+                - if:
+                    - condition: template
+                      value_template: >
+                        {{ 'off' in (state_attr(thermostat, 'hvac_modes') or []) }}
+                  then:
+                    - action: climate.set_hvac_mode
+                      target:
+                        entity_id: "{{ thermostat }}"
+                      data:
+                        hvac_mode: "off"
+                  else:
+                    - action: system_log.write
+                      data:
+                        level: warning
+                        logger: blueprints.room_heating
+                        message: >
+                          Room heating: {{ thermostat }} does not support off mode;
+                          cannot pause heating for an open window.
+      - stop: Open window; calibration skipped
+  - if:
+      - condition: template
+        value_template: >
+          {{ expand(window_sensors) | rejectattr('state', 'eq', 'off') | list | count > 0 }}
+    then:
+      - action: system_log.write
+        data:
+          level: warning
+          logger: blueprints.room_heating
+          message: >
+            Room heating: a window sensor in area {{ room }} has an unknown or
+            unavailable state; keeping the current heating mode until it recovers.
+      - stop: Waiting for known window states
+  - repeat:
+      for_each: "{{ thermostats if apply_heating else [] }}"
+      sequence:
+        - variables:
+            thermostat: "{{ repeat.item }}"
+        - if:
+            - condition: template
+              value_template: "{{ states(thermostat) not in ['unknown', 'unavailable'] }}"
+          then:
+            - variables:
+                setpoint: >
+                  {% set minimum = state_attr(thermostat, 'min_temp') %}
+                  {% set maximum = state_attr(thermostat, 'max_temp') %}
+                  {% set step = state_attr(thermostat, 'target_temp_step') or 0.5 %}
+                  {% set rounded = (target_temperature | float / step) | round * step %}
+                  {{ [[rounded, minimum] | max, maximum] | min }}
+            - if:
+                - condition: template
+                  value_template: >
+                    {{ state_attr(thermostat, 'temperature') != setpoint
+                       or states(thermostat) != 'heat' }}
+              then:
+                - if:
+                    - condition: template
+                      value_template: >
+                        {{ 'heat' in (state_attr(thermostat, 'hvac_modes') or []) }}
+                  then:
+                    - action: climate.set_temperature
+                      target:
+                        entity_id: "{{ thermostat }}"
+                      data:
+                        temperature: "{{ setpoint }}"
+                        hvac_mode: heat
+                  else:
+                    - action: system_log.write
+                      data:
+                        level: warning
+                        logger: blueprints.room_heating
+                        message: >
+                          Room heating: {{ thermostat }} does not support heat mode;
+                          skipping it.
+  - condition: template
+    value_template: "{{ trigger is defined and trigger.id in ['startup', 'calibration'] }}"
+  - if:
+      - condition: template
+        value_template: "{{ room_temperature is none }}"
+    then:
+      - action: system_log.write
+        data:
+          level: warning
+          logger: blueprints.room_heating
+          message: >
+            Room heating: no usable external temperature sensors in area
+            {{ room }}; skipping calibration, keeping current setpoints.
+      - stop: No usable room temperature for calibration
+  - repeat:
+      for_each: "{{ thermostats }}"
+      sequence:
+        - variables:
+            thermostat: "{{ repeat.item }}"
+            current_temperature: "{{ state_attr(repeat.item, 'current_temperature') }}"
+        - if:
+            - condition: template
+              value_template: >
+                {{ states(thermostat) not in ['unknown', 'unavailable']
+                   and is_number(current_temperature) }}
+          then:
+            - variables:
+                offset_entities: >
+                  {{ thermostat_offsets[thermostat] }}
+            - choose:
+                - conditions: "{{ offset_entities | count == 1 }}"
+                  sequence:
+                    - variables:
+                        offset_entity: "{{ offset_entities | first }}"
+                        old_offset: "{{ states(offset_entities | first) }}"
+                        offset_min: "{{ state_attr(offset_entities | first, 'min') }}"
+                        offset_max: "{{ state_attr(offset_entities | first, 'max') }}"
+                        offset_step: "{{ state_attr(offset_entities | first, 'step') }}"
+                    - if:
+                        - condition: template
+                          value_template: >
+                            {{ is_number(old_offset) and is_number(offset_min)
+                               and is_number(offset_max) and is_number(offset_step)
+                               and offset_step | float > 0
+                               and offset_min | float <= offset_max | float
+                               and state_attr(offset_entity, 'unit_of_measurement') in [none, '', '°C'] }}
+                      then:
+                        - variables:
+                            new_offset: >
+                              {% set value = old_offset | float + room_temperature - current_temperature | float %}
+                              {% set step = offset_step | float %}
+                              {% set minimum = offset_min | float %}
+                              {% set maximum = offset_max | float %}
+                              {% set steps = ((value - minimum) / step) | round %}
+                              {% set last_step = ((maximum - minimum) / step) | round(0, 'floor') %}
+                              {{ (minimum + [[steps, 0] | max, last_step] | min * step) | round(6) }}
+                        - if:
+                            - condition: template
+                              value_template: >
+                                {{ (new_offset - old_offset | float) | abs
+                                   >= offset_step | float * 0.5 }}
+                          then:
+                            - action: number.set_value
+                              target:
+                                entity_id: "{{ offset_entity }}"
+                              data:
+                                value: "{{ new_offset }}"
+                      else:
+                        - action: system_log.write
+                          data:
+                            level: warning
+                            logger: blueprints.room_heating
+                            message: >
+                              Room heating: invalid or unavailable calibration
+                              entity {{ offset_entity }}; skipping calibration.
+              default:
+                - action: system_log.write
+                  data:
+                    level: warning
+                    logger: blueprints.room_heating
+                    message: >
+                      Room heating: expected exactly one supported offset number
+                      for {{ thermostat }}, found {{ offset_entities | count }};
+                      skipping calibration.
